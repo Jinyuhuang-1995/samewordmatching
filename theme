@@ -1,0 +1,1112 @@
+"use strict";
+/*
+ * 同詞聯想的伺服器（不需要安裝任何套件，只要有 Node.js 18 以上）。
+ * 只做兩件事：提供遊戲網頁，以及在同一個房間的玩家之間轉送訊息。
+ * 遊戲規則都在網頁裡，伺服器不判斷輸贏，也不儲存任何資料。
+ */
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const PORT = process.env.PORT || 3000;
+const INDEX = path.join(__dirname, "public", "index.html");
+
+const ROOM_RE = /^[a-z0-9][a-z0-9_.-]{0,47}$/;
+const TOPIC_RE = /^[a-z][a-z0-9_.-]{0,47}$/;
+const ID_RE = /^[a-z0-9]{8,24}$/;
+const MAX_PER_ROOM = 8;
+const MAX_ROOMS = 500;
+const MAX_CONNS = 2000;
+const MAX_DATA_BYTES = 4096;
+const MAX_PRESENCE_BYTES = 2048;
+const MAX_FRAME = 16 * 1024;
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/* ------------------------------------------------------------------ */
+/* 網頁                                                                */
+/* ------------------------------------------------------------------ */
+const server = http.createServer((req, res) => {
+  const url = req.url.split("?")[0];
+  if (url === "/healthz") {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    return res.end("ok");
+  }
+  if (url === "/" || url === "/index.html") {
+    return fs.readFile(INDEX, (err, buf) => {
+      if (err) {
+        res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+        return res.end("找不到遊戲網頁");
+      }
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-cache",
+      });
+      res.end(buf);
+    });
+  }
+  res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+  res.end("not found");
+});
+
+/* ------------------------------------------------------------------ */
+/* 最小的 WebSocket（RFC 6455）：文字訊息、ping/pong、關閉              */
+/* ------------------------------------------------------------------ */
+function encodeFrame(op, payload) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | op, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | op;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | op;
+    header[1] = 127;
+    header.writeUInt32BE(0, 2);
+    header.writeUInt32BE(len, 6);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+class Conn {
+  constructor(socket, id) {
+    this.socket = socket;
+    this.cid = id;
+    this.open = true;
+    this.alive = true;
+    this.buf = Buffer.alloc(0);
+    this.frags = [];
+    this.fragOp = 0;
+    this.fragLen = 0;
+    this.myRooms = new Set();
+    this.win = { start: Date.now(), n: 0 };
+    this.onMessage = () => {};
+    this.onClose = () => {};
+    socket.setNoDelay(true);
+    socket.on("data", (d) => this.onData(d));
+    socket.on("close", () => this.finish());
+    socket.on("error", () => this.finish());
+  }
+  finish() {
+    if (!this.open) return;
+    this.open = false;
+    this.onClose();
+  }
+  write(buf) {
+    if (this.open && !this.socket.destroyed) {
+      try {
+        this.socket.write(buf);
+      } catch (e) {}
+    }
+  }
+  sendText(text) {
+    this.write(encodeFrame(0x1, Buffer.from(text, "utf8")));
+  }
+  ping() {
+    this.write(encodeFrame(0x9, Buffer.alloc(0)));
+  }
+  close(code, reason) {
+    if (!this.open) return;
+    const r = Buffer.from(reason || "", "utf8");
+    const p = Buffer.alloc(2 + r.length);
+    p.writeUInt16BE(code || 1000, 0);
+    r.copy(p, 2);
+    this.write(encodeFrame(0x8, p));
+    try {
+      this.socket.end();
+    } catch (e) {}
+    setTimeout(() => {
+      try {
+        this.socket.destroy();
+      } catch (e) {}
+    }, 1000).unref();
+  }
+  terminate() {
+    try {
+      this.socket.destroy();
+    } catch (e) {}
+    this.finish();
+  }
+  onData(chunk) {
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    for (;;) {
+      const b = this.buf;
+      if (b.length < 2) return;
+      const fin = (b[0] & 0x80) !== 0;
+      const op = b[0] & 0x0f;
+      const masked = (b[1] & 0x80) !== 0;
+      let len = b[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (b.length < 4) return;
+        len = b.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (b.length < 10) return;
+        if (b.readUInt32BE(2) !== 0) return this.close(1009, "too big");
+        len = b.readUInt32BE(6);
+        off = 10;
+      }
+      if (!masked) return this.close(1002, "unmasked");
+      if (len > MAX_FRAME) return this.close(1009, "too big");
+      if (b.length < off + 4 + len) return;
+      const mask = b.subarray(off, off + 4);
+      const payload = Buffer.from(b.subarray(off + 4, off + 4 + len));
+      for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      this.buf = b.subarray(off + 4 + len);
+      this.onFrame(fin, op, payload);
+      if (!this.open) return;
+    }
+  }
+  onFrame(fin, op, payload) {
+    if (op === 0x8) return this.close(1000, "");
+    if (op === 0x9) return this.write(encodeFrame(0xa, payload));
+    if (op === 0xa) {
+      this.alive = true;
+      return;
+    }
+    if (op === 0x1 || op === 0x2) {
+      this.fragOp = op;
+      this.frags = [payload];
+      this.fragLen = payload.length;
+    } else if (op === 0x0) {
+      this.frags.push(payload);
+      this.fragLen += payload.length;
+      if (this.fragLen > MAX_FRAME) return this.close(1009, "too big");
+    } else {
+      return;
+    }
+    if (fin) {
+      const msg = Buffer.concat(this.frags);
+      this.frags = [];
+      this.fragLen = 0;
+      if (this.fragOp === 0x1) this.onMessage(msg.toString("utf8"));
+    }
+  }
+}
+
+let connCount = 0;
+
+server.on("upgrade", (req, socket) => {
+  let url;
+  try {
+    url = new URL(req.url, "http://localhost");
+  } catch (e) {
+    return socket.destroy();
+  }
+  const id = url.searchParams.get("id") || "";
+  const key = req.headers["sec-websocket-key"];
+  const isWs = String(req.headers.upgrade || "").toLowerCase() === "websocket";
+  if (url.pathname !== "/ws" || !ID_RE.test(id) || !key || !isWs || connCount >= MAX_CONNS) {
+    return socket.destroy();
+  }
+  const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+  );
+  connCount++;
+  const conn = new Conn(socket, id);
+  conns.add(conn);
+  conn.onClose = () => {
+    connCount--;
+    conns.delete(conn);
+    for (const name of Array.from(conn.myRooms)) removeFrom(name, conn);
+  };
+  conn.onMessage = (text) => handleMessage(conn, text);
+});
+
+const conns = new Set();
+
+/* ------------------------------------------------------------------ */
+/* 房間                                                                */
+/* ------------------------------------------------------------------ */
+/** rooms: 房間名 -> Map(玩家 id -> { conn, presence }) */
+const rooms = new Map();
+
+function broadcast(name, obj) {
+  const room = rooms.get(name);
+  if (!room) return;
+  const text = JSON.stringify(obj);
+  for (const entry of room.values()) entry.conn.sendText(text);
+}
+
+function broadcastPeers(name) {
+  const room = rooms.get(name);
+  if (!room) return;
+  const peers = [];
+  for (const [id, entry] of room) peers.push({ peer: id, presence: entry.presence });
+  broadcast(name, { t: "peers", room: name, peers });
+}
+
+function removeFrom(name, conn) {
+  conn.myRooms.delete(name);
+  const room = rooms.get(name);
+  if (!room) return;
+  const entry = room.get(conn.cid);
+  if (entry && entry.conn === conn) room.delete(conn.cid);
+  if (room.size === 0) rooms.delete(name);
+  else broadcastPeers(name);
+}
+
+function byteLength(v) {
+  try {
+    return Buffer.byteLength(JSON.stringify(v === undefined ? null : v), "utf8");
+  } catch (e) {
+    return Infinity;
+  }
+}
+
+function handleMessage(conn, text) {
+  const now = Date.now();
+  if (now - conn.win.start > 1000) conn.win = { start: now, n: 0 };
+  if (++conn.win.n > 80) return;
+
+  let m;
+  try {
+    m = JSON.parse(text);
+  } catch (e) {
+    return;
+  }
+  if (!m || typeof m.room !== "string" || !ROOM_RE.test(m.room)) return;
+  const name = m.room;
+
+  if (m.t === "join") {
+    let room = rooms.get(name);
+    if (!room) {
+      if (rooms.size >= MAX_ROOMS) {
+        return conn.sendText(JSON.stringify({ t: "error", room: name, code: "busy" }));
+      }
+      room = new Map();
+      rooms.set(name, room);
+    }
+    const existing = room.get(conn.cid);
+    if (existing && existing.conn !== conn) {
+      // 同一個人重新連線：用新的連線取代舊的，保留原本的狀態
+      existing.conn.myRooms.delete(name);
+      existing.conn.close(4000, "replaced");
+    } else if (!existing && room.size >= MAX_PER_ROOM) {
+      return conn.sendText(JSON.stringify({ t: "error", room: name, code: "full" }));
+    }
+    room.set(conn.cid, { conn, presence: existing ? existing.presence : {} });
+    conn.myRooms.add(name);
+    broadcastPeers(name);
+    return;
+  }
+
+  const room = rooms.get(name);
+  const entry = room && room.get(conn.cid);
+  if (!entry || entry.conn !== conn) return;
+
+  if (m.t === "leave") {
+    removeFrom(name, conn);
+  } else if (m.t === "presence") {
+    if (!m.patch || typeof m.patch !== "object" || Array.isArray(m.patch)) return;
+    const next = Object.assign({}, entry.presence);
+    for (const k of Object.keys(m.patch)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(k)) continue;
+      if (m.patch[k] === null) delete next[k];
+      else next[k] = m.patch[k];
+    }
+    if (byteLength(next) > MAX_PRESENCE_BYTES) return;
+    entry.presence = next;
+    broadcastPeers(name);
+  } else if (m.t === "emit") {
+    if (typeof m.topic !== "string" || !TOPIC_RE.test(m.topic)) return;
+    if (byteLength(m.data) > MAX_DATA_BYTES) return;
+    broadcast(name, { t: "msg", room: name, topic: m.topic, peer: conn.cid, data: m.data });
+  }
+}
+
+// 定期檢查連線，清掉已經斷掉的玩家；同時避免主機因為閒置而切斷連線
+setInterval(() => {
+  for (const conn of conns) {
+    if (!conn.alive) {
+      conn.terminate();
+      continue;
+    }
+    conn.alive = false;
+    conn.ping();
+  }
+}, 25000).unref();
+
+server.listen(PORT, () => {
+  console.log("同詞聯想已啟動：http://localhost:" + PORT);
+});
+
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>同詞聯想</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=Noto+Serif+TC:wght@700;900&display=swap">
+<style>
+/* Layout: 單欄牌桌。中間是大張字牌，玩家狀態排在字牌下方，手機與桌機同一個結構。 */
+:root{
+  --bg:#E2EBE6; --surface:#F1F7F3; --tile:#FBFDFB; --tile-edge:#9DB8AD;
+  --ink:#15302B; --muted:#587570; --line:#B4C9C1;
+  --accent:#D2412B; --accent-ink:#FFFFFF;
+  --match:#CDEBD8; --match-line:#2E8B57; --warn:#B3261E;
+  --p0:#D2412B; --p1:#2F6DB3; --p2:#B07A08; --p3:#2A8A6C;
+  --font-display:"Noto Serif TC","Songti TC","PMingLiU",serif;
+  --font-body:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0F201D; --surface:#172B28; --tile:#20403B; --tile-edge:#0A1513;
+    --ink:#E5F0EB; --muted:#8FAAA4; --line:#2D4A45;
+    --accent:#FF6A4D; --accent-ink:#1A0B07;
+    --match:#1F5A44; --match-line:#6FD3A0; --warn:#FF8F85;
+    --p0:#FF7A5C; --p1:#7FB2EE; --p2:#EBB84E; --p3:#5BCBA3;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0F201D; --surface:#172B28; --tile:#20403B; --tile-edge:#0A1513;
+  --ink:#E5F0EB; --muted:#8FAAA4; --line:#2D4A45;
+  --accent:#FF6A4D; --accent-ink:#1A0B07;
+  --match:#1F5A44; --match-line:#6FD3A0; --warn:#FF8F85;
+  --p0:#FF7A5C; --p1:#7FB2EE; --p2:#EBB84E; --p3:#5BCBA3;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{min-height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-body);font-size:16px;line-height:1.6;
+  padding-block:0;
+  padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px));
+}
+#app{max-width:720px;margin:0 auto;padding-block:16px 48px;display:flex;flex-direction:column;gap:20px}
+button,input,select{font:inherit;color:inherit}
+h1,h2,h3,p{margin:0}
+h2{font-family:var(--font-display);font-weight:900;font-size:1.6rem;line-height:1.3;text-wrap:balance}
+
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:40px}
+.mark{font-family:var(--font-display);font-weight:900;font-size:1.15rem;letter-spacing:.12em}
+.top.entryTop .mark{visibility:hidden}
+#hdrRight{display:flex;align-items:center;gap:10px;min-width:0}
+.pill{background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:.9rem;white-space:nowrap}
+.pill b{letter-spacing:.2em;font-family:var(--font-display)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--match-line)}
+
+.stage{display:flex;flex-direction:column;gap:18px}
+.kicker{font-size:.8rem;letter-spacing:.14em;color:var(--muted);font-weight:700}
+.hint{color:var(--muted);font-size:.95rem;max-width:34em}
+.title{font-family:var(--font-display);font-weight:900;font-size:clamp(2.6rem,12vw,4rem);letter-spacing:.1em;line-height:1.1}
+.lead{font-size:1.1rem;max-width:30em}
+
+.btn{
+  appearance:none;border:0;cursor:pointer;background:var(--accent);color:var(--accent-ink);
+  font-weight:700;padding:.7em 1.4em;border-radius:8px;box-shadow:0 3px 0 rgba(0,0,0,.28);
+  transition:transform .08s,box-shadow .08s;
+}
+.btn:active{transform:translateY(2px);box-shadow:0 1px 0 rgba(0,0,0,.28)}
+.btn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+.btn.alt{background:var(--surface);color:var(--ink);border:1px solid var(--line);box-shadow:0 3px 0 var(--line)}
+.ghost{appearance:none;background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:.3em .9em;cursor:pointer;font-size:.9rem}
+:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.field{
+  width:100%;background:var(--tile);border:2px solid var(--line);border-radius:8px;
+  padding:.6em .8em;font-size:1.15rem;
+}
+.field:focus{border-color:var(--ink);outline:none}
+label{font-weight:700;font-size:.9rem}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px}
+.entryForm{display:flex;flex-direction:column;gap:14px;max-width:420px}
+.row{display:flex;gap:10px;align-items:stretch}
+.row .field{flex:1;min-width:0}
+.or{color:var(--muted);font-size:.9rem}
+.msg{color:var(--warn);min-height:1.5em;font-size:.95rem}
+.rules{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:.95rem;max-width:34em;padding-left:1.1em;margin:0}
+
+.codeLine{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.code{font-family:var(--font-display);font-weight:900;font-size:clamp(2.4rem,11vw,3.4rem);letter-spacing:.3em;line-height:1}
+.plist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.plist li{display:flex;align-items:center;gap:10px;background:var(--tile);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.sw{width:12px;height:12px;border-radius:3px;flex:none;background:var(--c,var(--muted))}
+.tag{margin-left:auto;font-size:.8rem;color:var(--muted)}
+.tag + .tag{margin-left:8px}
+.modes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.mode{display:flex;gap:10px;align-items:flex-start;background:var(--tile);border:2px solid var(--line);border-radius:10px;padding:12px;cursor:pointer}
+.mode input{margin-top:.35em;accent-color:var(--accent)}
+.mode.on{border-color:var(--ink)}
+.mode b{display:block;font-family:var(--font-display);font-size:1.1rem}
+.mode span{color:var(--muted);font-size:.9rem;display:block;line-height:1.5}
+.mode.fixed{cursor:default}
+.cfg{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.cfg select{background:var(--tile);border:2px solid var(--line);border-radius:8px;padding:.3em .6em}
+
+.roundline{display:flex;justify-content:space-between;gap:12px;align-items:baseline;color:var(--muted);font-size:.95rem}
+.roundline b{color:var(--ink);font-family:var(--font-display);font-size:1.15rem}
+.task{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:12px;align-items:flex-start}
+.bigword{
+  font-family:var(--font-display);font-weight:900;font-size:clamp(2.6rem,13vw,4.2rem);line-height:1.15;
+  background:var(--tile);border:1px solid var(--line);border-bottom:6px solid var(--tile-edge);border-radius:12px;
+  padding:.15em .6em;word-break:break-all;
+}
+.tile{
+  background:var(--tile);border:1px solid var(--line);border-top:5px solid var(--c,var(--line));border-bottom:5px solid var(--tile-edge);
+  border-radius:10px;padding:10px 12px;min-width:0;display:flex;flex-direction:column;gap:2px;position:relative;
+}
+.tile .who{font-size:.85rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile .w{font-family:var(--font-display);font-weight:900;font-size:1.7rem;line-height:1.25;word-break:break-all}
+.tile.match{background:var(--match);border-bottom-color:var(--match-line)}
+.tile .gain{position:absolute;top:8px;right:10px;font-weight:700;font-size:.9rem;color:var(--match-line)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:12px;width:100%}
+.tiles.sm .tile{padding:6px 10px}
+.tiles.sm .w{font-size:1.2rem}
+.tiles .tile{animation:flip .55s both;animation-delay:calc(var(--i,0)*.16s)}
+@keyframes flip{from{transform:perspective(500px) rotateX(-90deg);opacity:0}to{transform:none;opacity:1}}
+.used{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:.85rem;color:var(--muted)}
+.used span.c{background:var(--tile);border:1px solid var(--line);border-radius:6px;padding:0 8px;color:var(--ink)}
+.chips{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px}
+.chips li{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 14px 4px 10px;font-size:.95rem}
+.chips li.done{border-color:var(--match-line)}
+.chips .st{color:var(--muted);font-size:.85rem}
+.chips li.done .st{color:var(--match-line);font-weight:700}
+.sent{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.sent .tile{min-width:140px}
+.verdict.all{color:var(--match-line)}
+.board{display:flex;flex-direction:column;gap:8px}
+.board li{display:flex;align-items:center;gap:10px}
+.board .bar{height:10px;border-radius:5px;background:var(--c);min-width:6px}
+.board .n{font-variant-numeric:tabular-nums;font-weight:700}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.recap{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px}
+.recap li{display:flex;flex-direction:column;gap:6px}
+.recap .rh{font-size:.85rem;color:var(--muted);display:flex;gap:10px}
+.finalword{
+  font-family:var(--font-display);font-weight:900;font-size:clamp(3rem,16vw,5rem);line-height:1.1;
+  background:var(--match);border:1px solid var(--match-line);border-bottom:6px solid var(--match-line);border-radius:14px;padding:.1em .5em;align-self:flex-start;word-break:break-all;
+}
+.rank{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.rank li{display:flex;align-items:center;gap:12px;background:var(--tile);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.rank .pos{font-family:var(--font-display);font-weight:900;font-size:1.4rem;width:1.6em}
+.rank .sc{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:reduce){.tiles .tile{animation:none}.btn{transition:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="top" id="top"><span class="mark">同詞聯想</span><div id="hdrRight"></div></header>
+  <main id="main"></main>
+</div>
+
+<script>
+(function(){
+"use strict";
+var WORDS=["夜市","珍珠奶茶","捷運","颱風","便利商店","夏天","海邊","火鍋","手機","學校","生日","咖啡","下雨","週末","旅行","電影","貓","超市","睡覺","冰","公園","廟","機場","早餐","紅色","朋友","禮物","音樂","山","考試","辦公室","雞排","夜晚","運動","新年","烤肉","書","醫院","魔法","宇宙","夢","廚房","火車","月亮"];
+var CN=["零","一","兩","三","四"];
+var $=function(s){return document.querySelector(s)};
+var esc=function(s){return String(s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})};
+var norm=function(w){return String(w).normalize("NFKC").toLowerCase().replace(/[\s　.,!?'"「」『』、，。！？~～\-_·]/g,"")};
+var clean=function(w){return String(w==null?"":w).replace(/\s+/g," ").trim().slice(0,12)};
+
+var roomNS=null,R=null,code="",myName="",settled=false,wasHost=false,key="",myGid=0,connState=false;
+var myWords={},secret={},goneSince={};
+function fresh(){return {v:0,phase:"lobby",mode:"meld",total:10,players:[],round:0,prompt:null,history:[],submitted:[],scores:[]};}
+var S=fresh();
+
+/* ---------- 房間與身分 ---------- */
+function roster(){
+  if(!R) return [];
+  return R.peers().filter(function(p){return p.kind==="viewer"&&p.presence&&typeof p.presence.name==="string"})
+    .sort(function(a,b){return ((a.presence.t||0)-(b.presence.t||0))||(a.peer<b.peer?-1:1)});
+}
+function myPeer(){var m=R&&R.peers().find(function(p){return p.sameTab});return m?m.peer:null}
+function hostPeer(){var r=roster();return r.length?r[0].peer:null}
+function amHost(){return settled&&!!myPeer()&&hostPeer()===myPeer()}
+function myIdx(){var m=myPeer();return S.players.findIndex(function(p){return p.id===m})}
+function pname(p){return String(p.presence.name).slice(0,8)}
+function usedNorms(){
+  var s={};S.history.forEach(function(h){h.w.forEach(function(w){s[norm(w)]=w});if(h.p)s[norm(h.p)]=h.p});
+  if(S.mode==="meld"&&S.prompt)s[norm(S.prompt)]=S.prompt;
+  return s;
+}
+function pick(){
+  var used={};S.history.forEach(function(h){used[h.p]=1});
+  var pool=WORDS.filter(function(w){return !used[w]});
+  return pool[Math.floor(Math.random()*pool.length)]||WORDS[0];
+}
+
+/* ---------- 房主：遊戲流程 ---------- */
+function publish(){
+  S.v+=1;render();
+  if(R){R.emit("state",S).catch(function(){})}
+}
+function startGame(){
+  var ps=roster().slice(0,4);if(ps.length<2) return;
+  secret={};
+  S.gid=Date.now();myGid=S.gid;myWords={};
+  S.phase="write";S.players=ps.map(function(p){return {id:p.peer,name:pname(p)}});
+  S.round=1;S.history=[];S.submitted=[];S.scores=ps.map(function(){return 0});S.result=null;S.notice=null;
+  S.prompt=pick();
+  publish();
+}
+function onSubmit(peer,r,w){
+  if(!amHost()||S.phase!=="write"||r!==S.round) return;
+  var i=S.players.findIndex(function(p){return p.id===peer});if(i<0) return;
+  w=clean(w);if(!w||!norm(w)) return;
+  if(secret[i]!=null) return;
+  secret[i]=w;if(S.submitted.indexOf(i)<0)S.submitted.push(i);
+  var all=S.players.every(function(_,k){return secret[k]!=null});
+  if(all) reveal(); else publish();
+}
+function reveal(){
+  var N=S.players.length,words=S.players.map(function(_,i){return secret[i]});
+  var groups={},gain=words.map(function(){return 0});
+  words.forEach(function(w,i){var n=norm(w);(groups[n]=groups[n]||[]).push(i)});
+  Object.keys(groups).forEach(function(n){
+    var g=groups[n];
+    if(g.length===N) g.forEach(function(i){gain[i]=N});
+    else if(g.length>=2) g.forEach(function(i){gain[i]=1});
+  });
+  S.history.push({r:S.round,p:S.prompt,w:words,g:gain});
+  if(S.mode==="prompt") S.scores=S.scores.map(function(s,i){return s+gain[i]});
+  S.phase="reveal";publish();
+}
+function next(r){
+  if(!amHost()||S.phase!=="reveal"||r!==S.round) return;
+  var last=S.history[S.history.length-1],ns=last.w.map(norm);
+  var all=ns.every(function(n){return n===ns[0]});
+  if(S.mode==="meld"){
+    if(all){S.phase="end";S.result="win";return publish()}
+    if(S.round>=S.total){S.phase="end";S.result="lose";return publish()}
+    S.round+=1;S.prompt=null;
+  }else{
+    if(S.round>=S.total){S.phase="end";return publish()}
+    S.round+=1;S.prompt=pick();
+  }
+  S.phase="write";S.submitted=[];secret={};publish();
+}
+function toLobby(notice){
+  var v=S.v,m=S.mode,t=S.total;
+  S=fresh();S.v=v;S.mode=m;S.total=t;S.notice=notice||null;secret={};
+  publish();
+}
+function setMode(m){
+  if(!amHost()||S.phase!=="lobby") return;
+  S.mode=m;S.total=(m==="meld"?10:8);publish();
+}
+function setTotal(n){
+  if(!amHost()||S.phase!=="lobby") return;
+  S.total=n;publish();
+}
+
+/* ---------- 收發 ---------- */
+function onState(msg){
+  if(msg.sameTab) return;
+  var d=msg.data;
+  if(!d||typeof d.v!=="number"||d.v<=S.v||!Array.isArray(d.players)||!Array.isArray(d.history)||!Array.isArray(d.submitted)||!Array.isArray(d.scores)) return;
+  S=d;
+  if(S.gid!==myGid){myGid=S.gid;myWords={}}
+  render();resync();
+}
+function resync(){
+  if(!R||S.phase!=="write") return;
+  var i=myIdx();if(i<0) return;
+  var w=myWords[S.round];if(w==null||S.submitted.indexOf(i)>=0) return;
+  if(amHost()) onSubmit(myPeer(),S.round,w);
+  else R.emit("submit",{r:S.round,w:w}).catch(function(){});
+}
+function onPeersChange(){
+  if(!R) return;
+  var h=amHost();
+  if(h&&!wasHost){
+    wasHost=true;S.v+=100;
+    if(S.phase==="write"){
+      S.submitted=S.submitted.filter(function(i){return secret[i]!=null});
+      var mi=myIdx();
+      if(mi>=0&&myWords[S.round]!=null&&secret[mi]==null){secret[mi]=myWords[S.round];S.submitted.push(mi)}
+    }
+    publish();
+  }else if(!h){wasHost=false}
+  else{R.emit("state",S).catch(function(){})}
+  render();
+}
+setInterval(function(){
+  if(!R||!settled) return;
+  if(amHost()){
+    if(S.phase==="write"||S.phase==="reveal"){
+      var present={};roster().forEach(function(p){present[p.peer]=1});
+      var lost=false,now=Date.now();
+      S.players.forEach(function(p){
+        if(present[p.id]) delete goneSince[p.id];
+        else{if(!goneSince[p.id])goneSince[p.id]=now;if(now-goneSince[p.id]>15000)lost=true}
+      });
+      if(lost){goneSince={};toLobby("有玩家離線，已回到大廳。");return}
+    }
+    R.emit("state",S).catch(function(){});
+  }else resync();
+  render();
+},3000);
+
+/* ---------- 進出房間 ---------- */
+function rcode(){
+  var a="abcdefghjkmnpqrstuvwxyz23456789",s="";
+  for(var i=0;i<4;i++)s+=a[Math.floor(Math.random()*a.length)];
+  return s;
+}
+async function enter(c,savedNick){
+  var nick=(savedNick!=null?savedNick:$("#nick").value).trim().slice(0,8);
+  if(!nick){setMsg("先輸入你的名字");return}
+  try{localStorage.setItem("tc-nick",nick)}catch(e){}
+  myName=nick;code=c.toLowerCase();
+  setMsg("連線中…",true);
+  try{R=await roomNS.join("g-"+code)}catch(e){
+    R=null;try{sessionStorage.removeItem("tc-room")}catch(e2){}
+    setMsg(e&&e.message==="full"?"這個房間已經滿了":"加入房間失敗，請稍後再試");return;
+  }
+  try{sessionStorage.setItem("tc-room",JSON.stringify({code:code,name:myName}))}catch(e){}
+  S=fresh();myWords={};myGid=0;secret={};goneSince={};wasHost=false;settled=false;key="";
+  R.on("state",onState);
+  R.on("submit",function(m){if(amHost()&&!m.sameTab){var d=m.data||{};onSubmit(m.peer,d.r,d.w)}});
+  R.on("ctl",function(m){
+    if(!amHost()||m.sameTab) return;
+    if(!S.players.some(function(p){return p.id===m.peer})) return;
+    var d=m.data||{};
+    if(d.t==="next") next(d.r);
+    else if(d.t==="lobby"&&S.phase==="end") toLobby();
+  });
+  R.onPeers(onPeersChange);
+  R.onConnection(function(c2){connState=c2;refreshHeader()});
+  await R.presence({name:myName,t:Date.now()});
+  try{location.hash=code}catch(e){}
+  setTimeout(function(){settled=true;onPeersChange()},2000);
+  render();
+}
+async function leave(){
+  try{if(R)await R.leave()}catch(e){}
+  try{sessionStorage.removeItem("tc-room")}catch(e){}
+  R=null;settled=false;wasHost=false;S=fresh();key="";
+  try{history.replaceState(null,"",location.pathname+location.search)}catch(e){}
+  render();
+}
+function setMsg(t,neutral){var m=$("#entryMsg");if(m){m.textContent=t;m.style.color=neutral?"var(--muted)":""}}
+
+/* ---------- 畫面 ---------- */
+function screenKey(){
+  if(!R) return "entry:"+(roomNS?1:0);
+  var iP=myIdx()>=0;
+  if(S.phase==="lobby") return "lobby:"+amHost()+":"+S.mode+":"+S.total+":"+settled;
+  if(S.phase==="write") return "write:"+S.gid+":"+S.round+":"+iP+":"+(myWords[S.round]!=null);
+  if(S.phase==="reveal") return "reveal:"+S.gid+":"+S.round+":"+iP;
+  return "end:"+S.gid+":"+iP;
+}
+function render(){
+  var k=screenKey();
+  if(k!==key){key=k;build()}
+  refresh();
+}
+function refreshHeader(){
+  var h=$("#hdrRight"),top=$("#top");
+  top.className="top"+(R?"":" entryTop");
+  if(!R){h.innerHTML="";return}
+  h.innerHTML='<span class="pill">房間 <b>'+esc(code.toUpperCase())+'</b></span><span class="dot'+(R.connected()?" on":"")+'" title="連線狀態"></span><button class="ghost" id="leave" type="button">離開</button>';
+  $("#leave").onclick=leave;
+}
+function pc(i){return "var(--p"+(i%4)+")"}
+function cnPlayers(){return CN[Math.min(S.players.length||3,4)]+"個人"}
+
+function build(){
+  var m=$("#main");
+  if(!R){buildEntry(m);return}
+  if(S.phase==="lobby") buildLobby(m);
+  else if(S.phase==="write") buildWrite(m);
+  else if(S.phase==="reveal") buildReveal(m);
+  else buildEnd(m);
+}
+
+function buildEntry(m){
+  var nick="";try{nick=localStorage.getItem("tc-nick")||""}catch(e){}
+  var hashCode=(location.hash||"").replace("#","").slice(0,4).toUpperCase();
+  m.innerHTML=
+  '<section class="stage">'+
+    '<h1 class="title">同詞聯想</h1>'+
+    '<p class="lead">兩到四個人連線，同時寫下聯想到的詞，看你們能不能想到一起。</p>'+
+    '<form class="entryForm" id="entryForm">'+
+      '<div><label for="nick">你的名字</label><input class="field" id="nick" maxlength="8" autocomplete="off" value="'+esc(nick)+'"></div>'+
+      '<div class="row"><button class="btn" id="create" type="button">建立房間</button></div>'+
+      '<div class="or">或輸入朋友給的代碼</div>'+
+      '<div class="row"><input class="field" id="joinCode" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="四碼代碼" value="'+esc(hashCode)+'" aria-label="房間代碼"><button class="btn alt" id="join" type="submit">加入</button></div>'+
+      '<p class="msg" id="entryMsg" role="status"></p>'+
+    '</form>'+
+    '<ul class="rules">'+
+      '<li>心有靈犀：大家合作，把彼此寫的詞連起來，直到所有人寫出同一個詞。</li>'+
+      '<li>同詞得分：每輪一個題目，寫出和別人一樣的詞就得分。</li>'+
+    '</ul>'+
+  '</section>';
+  var ok=!!roomNS;
+  $("#create").disabled=!ok;$("#join").disabled=!ok;
+  if(!ok){
+    setMsg("連線功能無法使用",true);
+  }
+  $("#create").onclick=function(){enter(rcode())};
+  $("#entryForm").onsubmit=function(e){
+    e.preventDefault();
+    var c=$("#joinCode").value.trim().toLowerCase();
+    if(!/^[a-z0-9]{4}$/.test(c)){setMsg("代碼是四個字母或數字");return}
+    enter(c);
+  };
+}
+
+function buildLobby(m){
+  var host=amHost();
+  var modeBox;
+  if(host){
+    modeBox='<div class="modes" role="radiogroup" aria-label="玩法">'+
+      modeOpt("meld","心有靈犀","合作玩法。沒寫一樣就把大家的詞連起來，直到所有人寫出同一個詞。")+
+      modeOpt("prompt","同詞得分","每輪一個題目，寫出和別人相同的詞就得分，最後比總分。")+
+    '</div>'+
+    '<div class="cfg"><label for="total">回合數</label><select id="total">'+
+      (S.mode==="meld"?[6,8,10]:[5,8,10]).map(function(n){return '<option value="'+n+'"'+(n===S.total?" selected":"")+'>'+n+' 輪</option>'}).join("")+
+    '</select></div>';
+  }else{
+    modeBox='<p class="hint">玩法：<b>'+(S.mode==="meld"?"心有靈犀":"同詞得分")+'</b>，共 '+S.total+' 輪。由房主按開始。</p>';
+  }
+  m.innerHTML=
+  '<section class="stage">'+
+    '<div class="card">'+
+      '<p class="kicker">房間代碼</p>'+
+      '<div class="codeLine"><div class="code">'+esc(code.toUpperCase())+'</div><button class="ghost" id="copyLink" type="button">複製邀請連結</button><button class="ghost" id="copyCode" type="button">複製代碼</button></div>'+
+      '<p class="hint">把邀請連結傳給朋友，他們打開後輸入名字，按「加入」就能進來。</p>'+
+    '</div>'+
+    '<div class="card"><h2>玩家 <span id="count"></span></h2><ul class="plist" id="lobbyPlayers"></ul></div>'+
+    '<div class="card">'+modeBox+'</div>'+
+    '<p class="msg" id="notice"></p>'+
+    '<div class="actions">'+(host?'<button class="btn" id="startBtn" type="button">開始遊戲</button>':'<span class="hint" id="waitHost">等房主按開始。</span>')+'</div>'+
+  '</section>';
+  function copyText(text,btn,fail){
+    var old=btn.textContent;
+    function ok(){btn.textContent="已複製";setTimeout(function(){btn.textContent=old},1600)}
+    function bad(){btn.textContent=fail}
+    try{navigator.clipboard.writeText(text).then(ok,bad)}catch(e){bad()}
+  }
+  $("#copyCode").onclick=function(){copyText(code.toUpperCase(),this,"請手動記下代碼")};
+  $("#copyLink").onclick=function(){copyText(location.href.split("#")[0]+"#"+code,this,"請手動複製網址")};
+  if(host){
+    m.querySelectorAll('input[name="mode"]').forEach(function(r){r.onchange=function(){setMode(r.value)}});
+    $("#total").onchange=function(){setTotal(parseInt(this.value,10))};
+    $("#startBtn").onclick=startGame;
+  }
+}
+function modeOpt(v,t,d){
+  return '<label class="mode'+(S.mode===v?" on":"")+'"><input type="radio" name="mode" value="'+v+'"'+(S.mode===v?" checked":"")+'><div><b>'+t+'</b><span>'+d+'</span></div></label>';
+}
+
+function buildWrite(m){
+  var iP=myIdx()>=0,N=S.players.length,mine=myWords[S.round];
+  var modeName=S.mode==="meld"?"心有靈犀":"同詞得分";
+  var task;
+  if(S.mode==="prompt"){
+    task='<p class="kicker">題目</p><div class="bigword">'+esc(S.prompt)+'</div><p class="hint">寫下你第一個想到的詞。和別人寫一樣就得分，'+cnPlayers()+'都一樣最多。</p>';
+  }else if(S.round===1){
+    task='<p class="kicker">起始詞</p><div class="bigword">'+esc(S.prompt)+'</div><p class="hint">寫一個你聯想到的詞。目標是'+cnPlayers()+'寫出同一個詞，第一輪通常對不上，這很正常。</p>';
+  }else{
+    var last=S.history[S.history.length-1];
+    task='<p class="kicker">上一輪大家寫的</p><div class="tiles sm">'+
+      last.w.map(function(w,i){return tileHtml(i,w,false,0,i)}).join("")+
+    '</div><p class="hint">寫一個能把這些詞連在一起的詞。'+cnPlayers()+'寫出同一個詞就過關。</p>';
+  }
+  var usedHtml="";
+  if(S.mode==="meld"&&S.round>1){
+    var u=usedNorms(),keys=Object.keys(u);
+    usedHtml='<div class="used"><span>用過的詞不能再寫：</span>'+keys.map(function(k){return '<span class="c">'+esc(u[k])+'</span>'}).join("")+'</div>';
+  }
+  var zone;
+  if(!iP){
+    zone='<p class="hint">這局已經開始，你先旁觀，下一局就能加入。</p>';
+  }else if(mine!=null){
+    zone='<div class="sent"><div class="tile" style="--c:'+pc(myIdx())+'"><span class="who">你寫的</span><span class="w">'+esc(mine)+'</span></div><span class="hint" id="sentHint">已送出，等其他人。</span></div>';
+  }else{
+    zone='<form id="wf" class="stage" style="gap:10px"><label for="w">你的聯想詞</label>'+
+      '<div class="row"><input class="field" id="w" maxlength="12" autocomplete="off" enterkeyhint="send" placeholder="最多 12 個字"><button class="btn" type="submit">送出</button></div>'+
+      '<p class="msg" id="werr" role="alert"></p></form>';
+  }
+  m.innerHTML=
+  '<section class="stage">'+
+    '<div class="roundline"><span>第 <b>'+S.round+'</b> / '+S.total+' 輪</span><span>'+modeName+'</span></div>'+
+    '<div class="task">'+task+usedHtml+'</div>'+
+    zone+
+    '<ul class="chips" id="chips"></ul>'+
+  '</section>';
+  var wf=$("#wf");
+  if(wf){
+    wf.onsubmit=function(e){
+      e.preventDefault();
+      var w=clean($("#w").value),err=$("#werr");
+      if(!w||!norm(w)){err.textContent="先寫一個詞再送出";return}
+      var u=usedNorms();
+      if(S.mode==="meld"&&u[norm(w)]){err.textContent="這個詞已經用過了，換一個";return}
+      if(S.mode==="prompt"&&norm(w)===norm(S.prompt)){err.textContent="不能直接寫題目本身";return}
+      myWords[S.round]=w;
+      resync();render();
+    };
+    setTimeout(function(){var i=$("#w");if(i)i.focus()},50);
+  }
+}
+function tileHtml(i,w,match,gain,order){
+  var p=S.players[i]||{name:"?"};
+  return '<div class="tile'+(match?" match":"")+'" style="--c:'+pc(i)+';--i:'+order+'">'+
+    (gain>0?'<span class="gain">+'+gain+'</span>':"")+
+    '<span class="who">'+esc(p.name)+'</span><span class="w">'+esc(w)+'</span></div>';
+}
+
+function buildReveal(m){
+  var last=S.history[S.history.length-1],N=S.players.length,iP=myIdx()>=0;
+  var ns=last.w.map(norm),allMatch=ns.every(function(n){return n===ns[0]});
+  var anyMatch=last.g.some(function(g){return g>0});
+  var verdict,cls="";
+  if(allMatch){
+    cls=" all";
+    verdict=S.mode==="meld"?"心有靈犀！":"全員一致，每人 +"+N;
+  }else if(anyMatch){
+    verdict=S.mode==="meld"?"有人對上了，還差一點":"有人寫一樣，各得 1 分";
+  }else{
+    verdict="這輪沒有對上";
+  }
+  var nextLabel;
+  if(S.mode==="meld") nextLabel=(allMatch||S.round>=S.total)?"看結果":"下一輪：把詞連起來";
+  else nextLabel=S.round>=S.total?"看最後排名":"下一題";
+  var board="";
+  if(S.mode==="prompt"){
+    var mx=Math.max.apply(null,S.scores.concat([1]));
+    board='<div class="card"><p class="kicker">累計分數</p><ul class="plist board" style="gap:10px">'+
+      S.players.map(function(p,i){
+        return '<li style="background:transparent;border:0;padding:0"><span class="sw" style="--c:'+pc(i)+'"></span><span style="min-width:4em">'+esc(p.name)+'</span><span class="bar" style="--c:'+pc(i)+';width:'+Math.round(S.scores[i]/mx*60)+'%"></span><span class="n">'+S.scores[i]+'</span></li>';
+      }).join("")+'</ul></div>';
+  }
+  m.innerHTML=
+  '<section class="stage">'+
+    '<div class="roundline"><span>第 <b>'+S.round+'</b> / '+S.total+' 輪</span><span>'+(S.mode==="meld"?"心有靈犀":"同詞得分")+'</span></div>'+
+    (last.p?'<p class="hint">'+(S.mode==="prompt"?"題目":"起始詞")+'：<b>'+esc(last.p)+'</b></p>':"")+
+    '<h2 class="verdict'+cls+'">'+verdict+'</h2>'+
+    '<div class="tiles">'+last.w.map(function(w,i){return tileHtml(i,w,last.g[i]>0,S.mode==="prompt"?last.g[i]:0,i)}).join("")+'</div>'+
+    board+
+    '<div class="actions">'+(iP?'<button class="btn" id="nextBtn" type="button">'+nextLabel+'</button>':'<span class="hint">等玩家繼續。</span>')+'</div>'+
+  '</section>';
+  var nb=$("#nextBtn");
+  if(nb)nb.onclick=function(){
+    nb.disabled=true;
+    if(amHost()) next(S.round); else R.emit("ctl",{t:"next",r:S.round}).catch(function(){});
+    setTimeout(function(){var b=$("#nextBtn");if(b&&S.phase==="reveal")b.disabled=false},4000);
+  };
+}
+
+function recap(){
+  return '<ol class="recap">'+S.history.map(function(h){
+    var ns=h.w.map(norm);
+    return '<li><div class="rh"><span>第 '+h.r+' 輪</span>'+(h.p?'<span>'+(S.mode==="prompt"?"題目":"起始詞")+'：'+esc(h.p)+'</span>':"")+'</div>'+
+      '<div class="tiles sm">'+h.w.map(function(w,i){return tileHtml(i,w,h.g[i]>0,0,0).replace(/style="/,'style="animation:none;')}).join("")+'</div></li>';
+  }).join("")+'</ol>';
+}
+function buildEnd(m){
+  var iP=myIdx()>=0,body;
+  if(S.mode==="meld"){
+    var last=S.history[S.history.length-1];
+    if(S.result==="win"){
+      body='<p class="kicker">過關</p><h2>第 '+S.round+' 輪，大家寫出了同一個詞</h2><div class="finalword">'+esc(last.w[0])+'</div>';
+    }else{
+      body='<p class="kicker">時間到</p><h2>'+S.total+' 輪都沒有對上</h2><p class="hint">下次試著找更直接的連結，不用想得太巧妙。</p>';
+    }
+    body+='<div class="card"><p class="kicker">每一輪寫的詞</p>'+recap()+'</div>';
+  }else{
+    var order=S.players.map(function(p,i){return {i:i,n:p.name,s:S.scores[i]}}).sort(function(a,b){return b.s-a.s});
+    var top=order[0].s;
+    var winners=order.filter(function(o){return o.s===top}).map(function(o){return esc(o.n)}).join("、");
+    var pos=0,prev=null;
+    body='<p class="kicker">最後排名</p><h2>'+(top>0?winners+" 的默契最好":"這局沒有人對上")+'</h2>'+
+      '<ol class="rank">'+order.map(function(o,k){
+        if(o.s!==prev){pos=k+1;prev=o.s}
+        return '<li><span class="pos">'+pos+'</span><span class="sw" style="--c:'+pc(o.i)+'"></span><span>'+esc(o.n)+'</span><span class="sc">'+o.s+' 分</span></li>';
+      }).join("")+'</ol>'+
+      '<div class="card"><p class="kicker">每一輪寫的詞</p>'+recap()+'</div>';
+  }
+  m.innerHTML='<section class="stage">'+body+'<div class="actions">'+(iP?'<button class="btn" id="again" type="button">再玩一局</button>':"")+'</div></section>';
+  var ag=$("#again");
+  if(ag)ag.onclick=function(){
+    if(amHost()) toLobby(); else R.emit("ctl",{t:"lobby"}).catch(function(){});
+  };
+}
+
+/* ---------- 動態區塊 ---------- */
+function refresh(){
+  refreshHeader();
+  if(!R) return;
+  if(S.phase==="lobby"){
+    var r=roster(),lp=$("#lobbyPlayers");
+    if(!lp) return;
+    var hp=hostPeer(),me=myPeer();
+    lp.innerHTML=r.map(function(p,i){
+      return '<li><span class="sw" style="--c:'+(i<4?pc(i):"var(--muted)")+'"></span><span>'+esc(pname(p))+'</span>'+
+        (p.peer===hp?'<span class="tag">房主</span>':"")+(p.peer===me?'<span class="tag">你</span>':"")+(i>=4?'<span class="tag">旁觀</span>':"")+'</li>';
+    }).join("")||'<li><span class="hint">連線中…</span></li>';
+    $("#count").textContent=Math.min(r.length,4)+" / 4";
+    var sb=$("#startBtn");
+    if(sb){
+      var n=Math.min(r.length,4);
+      sb.disabled=!(settled&&n>=2);
+      sb.textContent=!settled?"連線中…":(n>=2?"開始遊戲（"+n+" 人）":"至少要 2 人");
+    }
+    var nt=$("#notice");if(nt)nt.textContent=S.notice||"";
+  }else if(S.phase==="write"){
+    var ch=$("#chips");if(!ch) return;
+    var present={};roster().forEach(function(p){present[p.peer]=1});
+    var me2=myPeer();
+    ch.innerHTML=S.players.map(function(p,i){
+      var done=S.submitted.indexOf(i)>=0||(p.id===me2&&myWords[S.round]!=null);
+      var off=!present[p.id];
+      return '<li class="'+(done?"done":"")+'"><span class="sw" style="--c:'+pc(i)+'"></span><span>'+esc(p.name)+(p.id===me2?"（你）":"")+'</span><span class="st">'+(off?"離線":(done?"已送出":"思考中…"))+'</span></li>';
+    }).join("");
+  }
+}
+
+/* ---------- 連線層：用 WebSocket 提供和房間一樣的介面 ---------- */
+function makeRoomNS(){
+  var cid=null;
+  try{cid=sessionStorage.getItem("tc-cid")}catch(e){}
+  if(!cid){
+    var abc="abcdefghijklmnopqrstuvwxyz0123456789",bytes=new Uint8Array(12);
+    (window.crypto||window.msCrypto).getRandomValues(bytes);
+    cid=Array.prototype.map.call(bytes,function(b){return abc[b%36]}).join("");
+    try{sessionStorage.setItem("tc-cid",cid)}catch(e){}
+  }
+  var ws=null,open=false,wanted={},backoff=500;
+
+  function send(o){
+    if(ws&&open){try{ws.send(JSON.stringify(o));return true}catch(e){}}
+    return false;
+  }
+  function connect(){
+    var proto=location.protocol==="https:"?"wss://":"ws://";
+    try{ws=new WebSocket(proto+location.host+"/ws?id="+cid)}catch(e){setTimeout(connect,2000);return}
+    ws.onopen=function(){
+      open=true;backoff=500;
+      Object.keys(wanted).forEach(function(n){
+        var r=wanted[n];
+        send({t:"join",room:n});
+        if(r._pres&&Object.keys(r._pres).length)send({t:"presence",room:n,patch:r._pres});
+        r._conn(true);
+      });
+    };
+    ws.onmessage=function(ev){
+      var m;try{m=JSON.parse(ev.data)}catch(e){return}
+      var r=wanted[m.room];if(r)r._recv(m);
+    };
+    ws.onclose=function(){
+      open=false;
+      Object.keys(wanted).forEach(function(n){wanted[n]._conn(false)});
+      setTimeout(connect,backoff);backoff=Math.min(backoff*2,8000);
+    };
+    ws.onerror=function(){try{ws.close()}catch(e){}};
+  }
+
+  function makeRoom(name){
+    var handlers={},peerHs=[],connHs=[],list=[],first=false;
+    var room={name:name,_pres:{}};
+    function rm(arr,fn){var i=arr.indexOf(fn);if(i>=0)arr.splice(i,1)}
+    room._recv=function(m){
+      if(m.t==="peers"&&Array.isArray(m.peers)){
+        list=Object.freeze(m.peers.map(function(p){
+          return Object.freeze({
+            peer:p.peer,presence:Object.freeze(p.presence||{}),kind:"viewer",
+            isMe:p.peer===cid,sameTab:p.peer===cid,guest:false,by:null,updatedAt:Date.now()
+          });
+        }));
+        if(!first){first=true;if(room._onFirst)room._onFirst()}
+        peerHs.slice().forEach(function(h){try{h({peers:list})}catch(e){console.error(e)}});
+      }else if(m.t==="msg"&&typeof m.topic==="string"){
+        (handlers[m.topic]||[]).slice().forEach(function(h){
+          try{h({topic:m.topic,peer:m.peer,data:m.data,isMe:m.peer===cid,sameTab:m.peer===cid,kind:"viewer",guest:false,by:null})}
+          catch(e){console.error(e)}
+        });
+      }else if(m.t==="error"&&m.code==="full"){
+        if(room._onFull)room._onFull();
+      }
+    };
+    room._conn=function(v){connHs.slice().forEach(function(h){try{h(v)}catch(e){}})};
+    room.peers=function(){return list};
+    room.on=function(topic,h){
+      (handlers[topic]=handlers[topic]||[]).push(h);
+      return function(){rm(handlers[topic]||[],h)};
+    };
+    room.emit=function(topic,data){send({t:"emit",room:name,topic:topic,data:data});return Promise.resolve()};
+    room.presence=function(patch){
+      Object.keys(patch).forEach(function(k){
+        if(patch[k]===null)delete room._pres[k];else room._pres[k]=patch[k];
+      });
+      send({t:"presence",room:name,patch:patch});
+      return Promise.resolve();
+    };
+    room.onPeers=function(h){peerHs.push(h);return function(){rm(peerHs,h)}};
+    room.connected=function(){return open};
+    room.onConnection=function(h){
+      connHs.push(h);
+      Promise.resolve().then(function(){h(open)});
+      return function(){rm(connHs,h)};
+    };
+    room.leave=function(){
+      send({t:"leave",room:name});delete wanted[name];return Promise.resolve();
+    };
+    return room;
+  }
+
+  connect();
+  return {
+    join:function(name){
+      return new Promise(function(resolve,reject){
+        var r=makeRoom(name),done=false;
+        wanted[name]=r;
+        var to=setTimeout(function(){
+          if(done) return;done=true;delete wanted[name];reject(new Error("timeout"));
+        },10000);
+        r._onFirst=function(){if(done) return;done=true;clearTimeout(to);resolve(r)};
+        r._onFull=function(){if(done) return;done=true;clearTimeout(to);delete wanted[name];reject(new Error("full"))};
+        if(open)send({t:"join",room:name});
+      });
+    }
+  };
+}
+
+/* ---------- 啟動 ---------- */
+(async function boot(){
+  render();
+  roomNS=makeRoomNS();
+  key="";render();
+  var saved=null;
+  try{saved=JSON.parse(sessionStorage.getItem("tc-room")||"null")}catch(e){}
+  if(saved&&/^[a-z0-9]{4}$/.test(saved.code||"")&&saved.name) enter(saved.code,saved.name);
+})();
+})();
+</script>
+</body>
+</html>
+
+{
+  "name": "same-word-game",
+  "version": "1.0.0",
+  "description": "同詞聯想：2 到 4 人連線的聯想詞遊戲",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
